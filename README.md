@@ -20,12 +20,16 @@ https://github.com/user-attachments/assets/426e0959-7355-4883-b26a-c4945bfdebb5
 | :---: | :---: |
 | ![Expanded Card](assets/expanded-card.png) | ![Playlists Drawer](assets/playlists-drawer.png) |
 
+| Podcast Mode |
+| :---: |
+| ![Podcast Mode](assets/podcast-mode.png) |
+
 ## Features
 
 * **Top-Center Spring Drop-Down:** Rests as a click-through 3.5px dynamic glow bar at the top-center of your screen; hover for 150ms to drop down.
 * **Auto-Peek & 7-Bar Visualizer:** Briefly glides down on track changes with a glowing harmonic waveform, then tucks away automatically.
 * **Dynamic Album-Art Tinting:** Extracts vibrant accent colors from every cover and crossfades the frosted glass glow.
-* **Animated Wavy Progress Slider:** Squiggly One UI–style progress bar while playing that flattens smoothly when paused or scrubbing.
+* **Animated Wavy Progress Slider:** Squiggly One UI-style progress bar while playing that flattens smoothly when paused or scrubbing.
 * **Swipeable Drawer (`Queue` • `Liked` • `Playlists` • `Search`):**
   * **Queue:** Slide right (`→`) to play now, slide left (`←`) to remove & auto-skip.
   * **Liked / Playlists / Search:** Click to play, slide right (`→`) to add to queue, slide left (`←`) to save/unlike.
@@ -50,7 +54,8 @@ https://github.com/user-attachments/assets/426e0959-7355-4883-b26a-c4945bfdebb5
    ```bash
    python now_bar.py
    ```
-   *(Works immediately in local SMTC mode—no login required. Detaches silently via `pythonw.exe` so closing the terminal won't close the bar.)*
+
+*(Works immediately in local SMTC mode—no login required. Detaches silently via `pythonw.exe` so closing the terminal won't close the bar.)*
 
 ## Optional: Link Spotify Web API (Unlocks Heart, Shuffle, Repeat, Queue, Playlists, Search & Volume)
 
