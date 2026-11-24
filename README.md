@@ -1,24 +1,60 @@
-# spotify-now-bar
+# Spotify Now Bar for Windows
 
-## Overview
-A lightweight (~50 MB RAM, ~0% idle CPU) Samsung One UI–inspired "Now Bar" for Spotify on Windows, built with Python, PySide6, Windows SMTC, and the Spotify Web API (PKCE).
+A lightweight, native **Samsung One UI 7–style floating Now Bar** built exclusively for **Spotify on Windows 11**. Designed to run smoothly on integrated graphics (~40–55 MB RAM, ~0% CPU when hidden) with zero Electron or Rainmeter overhead.
 
-## Key Features
-- **Zero-clutter top-center trigger**: Invisible when Spotify is closed, 3.5px dynamic album-art glow bar when playing, smooth spring drop-down on hover.
-- **Adaptive One UI design**: Real-time dominant color extraction from album art, animated wavy progress slider, 7-bar harmonic waveform.
-- **Full playback & library drawer**: Hover-expandable Spotify volume control, Heart/Like, Shuffle/Repeat, and slide-gesture drawer for Queue, Liked Songs, Playlists, and Search.
+## Demo
 
-## Project Structure
-- `now_bar.py`
-- `spotify_api.py`
-- `smtc_listener.py`
-- `config.py`
-- `requirements.txt`
+<!-- Drag and drop LumiSnap_20261124_110842.mp4 here in the GitHub web editor -->
 
-> **Security Note:** Never commit `config.json` or `now_bar_error.log` to version control.
+## Screenshots
 
-## Installation & Setup
-```bash
-pip install -r requirements.txt
-python now_bar.py
-```
+| Compact Pill (Auto-Peek) | Local SMTC Mode (Zero Setup) |
+| :---: | :---: |
+| ![Compact Pill](assets/compact-pill.png) | ![Local SMTC Mode](assets/local-smtc-mode.png) |
+
+| Expanded Player (Hybrid Mode) | Playlists & Library Drawer |
+| :---: | :---: |
+| ![Expanded Card](assets/expanded-card.png) | ![Playlists Drawer](assets/playlists-drawer.png) |
+
+## Features
+
+* **Top-Center Spring Drop-Down:** Rests as a click-through 3.5px dynamic glow bar at the top-center of your screen; hover for 150ms to drop down.
+* **Auto-Peek & 7-Bar Visualizer:** Briefly glides down on track changes with a glowing harmonic waveform, then tucks away automatically.
+* **Dynamic Album-Art Tinting:** Extracts vibrant accent colors from every cover and crossfades the frosted glass glow.
+* **Animated Wavy Progress Slider:** Squiggly One UI–style progress bar while playing that flattens smoothly when paused or scrubbing.
+* **Swipeable Drawer (`Queue` • `Liked` • `Playlists` • `Search`):**
+  * **Queue:** Slide right (`→`) to play now, slide left (`←`) to remove & auto-skip.
+  * **Liked / Playlists / Search:** Click to play, slide right (`→`) to add to queue, slide left (`←`) to save/unlike.
+* **Hover Volume Capsule:** Hover the speaker icon (or scroll anywhere on the bar) to adjust Spotify's app volume independently of Windows master volume.
+* **Podcast Mode:** Automatically switches to `-10s` / `+10s` (hold `Shift` for `±30s`), speed control, and `H:MM:SS` timestamps when playing podcasts.
+* **Smart Windows Integration:** Stays completely hidden when Spotify is closed, pauses hover triggers in fullscreen apps/games, double-click cover art to focus Spotify, and includes a 1-click **Start with Windows** tray toggle.
+
+## Quick Start
+
+1. **Clone the repo:**
+   ```bash
+   git clone https://github.com/Sourishthegamer/spotify-now-bar
+   cd spotify-now-bar
+   ```
+
+2. **Install dependencies:**
+   ```bash
+   python -m pip install -r requirements.txt
+   ```
+
+3. **Run:**
+   ```bash
+   python now_bar.py
+   ```
+   *(Works immediately in local SMTC mode—no login required. Detaches silently via `pythonw.exe` so closing the terminal won't close the bar.)*
+
+## Optional: Link Spotify Web API (Unlocks Heart, Shuffle, Repeat, Queue, Playlists, Search & Volume)
+
+1. Go to the Spotify Developer Dashboard (`developer.spotify.com/dashboard`) and click **Create App**.
+2. Set **Redirect URI** to `<REDIRECT_URI>` and check **Web API**.
+3. Under **Settings → User Management**, add your Spotify account email.
+4. Copy your **Client ID**, right-click the green tray icon → **Connect / Re-link Spotify Web API...**, paste it in, and authorize in your browser.
+
+## License
+
+MIT
