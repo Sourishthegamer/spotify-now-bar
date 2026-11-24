@@ -1,3 +1,4 @@
+import asyncio
 import colorsys
 import ctypes
 import ctypes.wintypes
@@ -53,30 +54,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from config import APP_DIR, load_config, save_config
+from config import load_config, save_config
 from smtc_listener import SpotifySMTCListener, TrackState
 from spotify_api import REDIRECT_URI, SpotifyExtraState, SpotifyWebAPI, TrackItem
 
-# --- Crash Logger (Helpful when running silently under pythonw.exe) ---
-
-ERROR_LOG_PATH = APP_DIR / "now_bar_error.log"
-
-
-def _install_error_hook() -> None:
-    """Logs any uncaught exceptions to now_bar_error.log when running without a console."""
-    def _hook(exc_type, exc_value, exc_tb):
-        try:
-            with ERROR_LOG_PATH.open("a", encoding="utf-8") as f:
-                f.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
-                traceback.print_exception(exc_type, exc_value, exc_tb, file=f)
-        except Exception:
-            pass
-        sys.__excepthook__(exc_type, exc_value, exc_tb)
-
-    sys.excepthook = _hook
-
-
-# --- Win32, DWM, Process & Startup Registry Helpers ---
+# --- Win32, DWM & Startup Helpers (64-bit Safe) ---
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -106,8 +88,26 @@ DWMWCP_DONOTROUND = 1
 DWMWA_BORDER_COLOR = 34
 DWMWA_COLOR_NONE = 0xFFFFFFFE
 
-RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
-RUN_VALUE_NAME = "SpotifyNowBar"
+AUTOSTART_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+AUTOSTART_APP_NAME = "SpotifyNowBar"
+
+# Explicit 64-bit return types so Windows HANDLE/HWND pointers are never truncated
+user32.GetForegroundWindow.restype = ctypes.wintypes.HWND
+user32.MonitorFromWindow.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.DWORD]
+user32.MonitorFromWindow.restype = ctypes.wintypes.HMONITOR
+kernel32.OpenProcess.argtypes = [
+    ctypes.wintypes.DWORD,
+    ctypes.wintypes.BOOL,
+    ctypes.wintypes.DWORD,
+]
+kernel32.OpenProcess.restype = ctypes.wintypes.HANDLE
+kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
+kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
+kernel32.CreateToolhelp32Snapshot.argtypes = [
+    ctypes.wintypes.DWORD,
+    ctypes.wintypes.DWORD,
+]
+kernel32.CreateToolhelp32Snapshot.restype = ctypes.wintypes.HANDLE
 
 
 class MONITORINFO(ctypes.Structure):
@@ -124,7 +124,7 @@ class PROCESSENTRY32W(ctypes.Structure):
         ("dwSize", ctypes.wintypes.DWORD),
         ("cntUsage", ctypes.wintypes.DWORD),
         ("th32ProcessID", ctypes.wintypes.DWORD),
-        ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+        ("th32DefaultHeapID", ctypes.c_size_t),
         ("th32ModuleID", ctypes.wintypes.DWORD),
         ("cntThreads", ctypes.wintypes.DWORD),
         ("th32ParentProcessID", ctypes.wintypes.DWORD),
@@ -134,38 +134,20 @@ class PROCESSENTRY32W(ctypes.Structure):
     ]
 
 
-kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
-kernel32.CreateToolhelp32Snapshot.argtypes = [ctypes.wintypes.DWORD, ctypes.wintypes.DWORD]
+kernel32.Process32FirstW.argtypes = [
+    ctypes.wintypes.HANDLE,
+    ctypes.POINTER(PROCESSENTRY32W),
+]
 kernel32.Process32FirstW.restype = ctypes.wintypes.BOOL
-kernel32.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.POINTER(PROCESSENTRY32W)]
+kernel32.Process32NextW.argtypes = [
+    ctypes.wintypes.HANDLE,
+    ctypes.POINTER(PROCESSENTRY32W),
+]
 kernel32.Process32NextW.restype = ctypes.wintypes.BOOL
-kernel32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(PROCESSENTRY32W)]
-kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-
-
-def is_spotify_running() -> bool:
-    """Fast native Win32 snapshot check for Spotify.exe (zero subprocesses, <1ms)."""
-    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-    if not snap or snap == INVALID_HANDLE_VALUE:
-        return False
-    try:
-        entry = PROCESSENTRY32W()
-        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
-        if kernel32.Process32FirstW(snap, ctypes.byref(entry)):
-            while True:
-                if entry.szExeFile.lower() == "spotify.exe":
-                    return True
-                if not kernel32.Process32NextW(snap, ctypes.byref(entry)):
-                    break
-    except Exception:
-        pass
-    finally:
-        kernel32.CloseHandle(snap)
-    return False
 
 
 def disable_dwm_frame(hwnd: int) -> None:
-    """Removes the Windows 11 DWM rounded box outline & drop shadow on transparent windows."""
+    """Eliminates Windows 11 DWM ghost box outline & drop shadow on transparent windows."""
     try:
         style = user32.GetWindowLongW(hwnd, GWL_STYLE)
         style &= ~(WS_BORDER | WS_THICKFRAME | WS_DLGFRAME)
@@ -186,7 +168,10 @@ def disable_dwm_frame(hwnd: int) -> None:
 
         val_border = ctypes.c_uint32(DWMWA_COLOR_NONE)
         dwmapi.DwmSetWindowAttribute(
-            hwnd, DWMWA_BORDER_COLOR, ctypes.byref(val_border), ctypes.sizeof(val_border)
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            ctypes.byref(val_border),
+            ctypes.sizeof(val_border),
         )
 
         user32.SetWindowPos(
@@ -203,7 +188,6 @@ def disable_dwm_frame(hwnd: int) -> None:
 
 
 def set_click_through(hwnd: int, enable: bool) -> None:
-    """Toggles Win32 WS_EX_TRANSPARENT so the hidden bar never blocks browser tabs."""
     try:
         style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
         if enable:
@@ -215,8 +199,30 @@ def set_click_through(hwnd: int, enable: bool) -> None:
         pass
 
 
+def is_spotify_running() -> bool:
+    """Lightweight Win32 snapshot check for Spotify.exe (no subprocess/console flash)."""
+    snap = None
+    try:
+        snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if not snap or snap == INVALID_HANDLE_VALUE:
+            return False
+        pe = PROCESSENTRY32W()
+        pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        if kernel32.Process32FirstW(snap, ctypes.byref(pe)):
+            while True:
+                if pe.szExeFile.lower() == "spotify.exe":
+                    return True
+                if not kernel32.Process32NextW(snap, ctypes.byref(pe)):
+                    break
+    except Exception:
+        return False
+    finally:
+        if snap and snap != INVALID_HANDLE_VALUE:
+            kernel32.CloseHandle(snap)
+    return False
+
+
 def is_foreground_fullscreen(own_hwnd: int) -> bool:
-    """Detects whether the currently active window is covering the entire monitor."""
     try:
         hwnd = user32.GetForegroundWindow()
         if not hwnd or hwnd == own_hwnd:
@@ -268,7 +274,7 @@ def _get_exe_name(hwnd: int) -> str:
 
 
 def open_spotify_app() -> None:
-    """Restores Spotify from minimized/tray or launches it if closed."""
+    """Restores Spotify from minimized/system tray or launches it if closed."""
     found_hwnd = [0]
     EnumWindowsProc = ctypes.WINFUNCTYPE(
         ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM
@@ -311,32 +317,35 @@ def open_spotify_app() -> None:
         pass
 
 
-def _get_pythonw_path() -> str:
+def _pythonw_path() -> str:
     pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
     return pyw if os.path.exists(pyw) else sys.executable
 
 
-def is_autostart_enabled() -> bool:
+def get_autostart_enabled() -> bool:
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0, winreg.KEY_READ) as key:
-            val, _ = winreg.QueryValueEx(key, RUN_VALUE_NAME)
-            return bool(val)
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, AUTOSTART_REG_PATH, 0, winreg.KEY_READ
+        ) as key:
+            winreg.QueryValueEx(key, AUTOSTART_APP_NAME)
+            return True
     except OSError:
         return False
 
 
 def set_autostart_enabled(enable: bool) -> bool:
-    """Adds or removes silent pythonw.exe startup entry in HKCU\\...\\Run."""
+    """Adds or removes silent pythonw startup entry in HKCU Run registry key."""
     try:
         with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0, winreg.KEY_SET_VALUE
+            winreg.HKEY_CURRENT_USER, AUTOSTART_REG_PATH, 0, winreg.KEY_SET_VALUE
         ) as key:
             if enable:
-                cmd = f'"{_get_pythonw_path()}" "{os.path.abspath(__file__)}" --detached'
-                winreg.SetValueEx(key, RUN_VALUE_NAME, 0, winreg.REG_SZ, cmd)
+                script = os.path.abspath(__file__)
+                cmd = f'"{_pythonw_path()}" "{script}"'
+                winreg.SetValueEx(key, AUTOSTART_APP_NAME, 0, winreg.REG_SZ, cmd)
             else:
                 try:
-                    winreg.DeleteValue(key, RUN_VALUE_NAME)
+                    winreg.DeleteValue(key, AUTOSTART_APP_NAME)
                 except FileNotFoundError:
                     pass
         return True
@@ -344,10 +353,10 @@ def set_autostart_enabled(enable: bool) -> bool:
         return False
 
 
-# --- Dynamic Album-Art Color Extraction & Utilities ---
+# --- Dynamic Album-Art Color Extraction ---
 
 def extract_accent_colors(img_bytes: Optional[bytes]) -> Tuple[QColor, QColor]:
-    """Samples the cover art at 24x24 to pick vibrant dark-glass accent & glow colors."""
+    """Extracts vibrant primary & secondary ambient colors from album/podcast cover."""
     fallback = (QColor(29, 185, 84), QColor(20, 120, 68))
     if not img_bytes:
         return fallback
@@ -375,7 +384,8 @@ def extract_accent_colors(img_bytes: Optional[bytes]) -> Tuple[QColor, QColor]:
         v1 = max(0.64, min(0.94, v))
         pr, pg, pb = [int(x * 255) for x in colorsys.hsv_to_rgb(h, s1, v1)]
         sr, sg, sb = [
-            int(x * 255) for x in colorsys.hsv_to_rgb((h + 0.06) % 1.0, s1 * 0.8, v1 * 0.55)
+            int(x * 255)
+            for x in colorsys.hsv_to_rgb((h + 0.06) % 1.0, s1 * 0.8, v1 * 0.55)
         ]
         return QColor(pr, pg, pb), QColor(sr, sg, sb)
     except Exception:
@@ -384,7 +394,11 @@ def extract_accent_colors(img_bytes: Optional[bytes]) -> Tuple[QColor, QColor]:
 
 def fmt_time(ms: int) -> str:
     sec = max(0, int(ms // 1000))
-    return f"{sec // 60}:{sec % 60:02d}"
+    hrs, rem = divmod(sec, 3600)
+    mins, secs = divmod(rem, 60)
+    if hrs > 0:
+        return f"{hrs}:{mins:02d}:{secs:02d}"
+    return f"{mins}:{secs:02d}"
 
 
 def lerp(a: float, b: float, t: float) -> float:
@@ -441,7 +455,7 @@ class SpotifyConnectDialog(QDialog):
         layout.setContentsMargins(20, 20, 20, 20)
 
         info = QLabel(
-            "<b>Connect / Re-link Spotify (Heart • Queue • Liked • Playlists • Search • Volume):</b><br><br>"
+            "<b>Connect / Re-link Spotify (Heart • Queue • Liked • Playlists • Search):</b><br><br>"
             "1. Open <b>developer.spotify.com/dashboard</b> → your App.<br>"
             f"2. Redirect URI must be: <code>{REDIRECT_URI}</code><br>"
             "3. Paste your <b>Client ID</b> below and authorize in your browser."
@@ -485,7 +499,7 @@ class SpotifyConnectDialog(QDialog):
             self.accept()
 
 
-# --- Main Floating One UI Now Bar (27" 1440p Tuned & iGPU Optimized) ---
+# --- Main Floating One UI 7 Now Bar (27" 1440p Tuned + Podcast Mode) ---
 
 class SpotifyNowBar(QWidget):
     smtc_updated = Signal(object)
@@ -506,10 +520,9 @@ class SpotifyNowBar(QWidget):
         self.cfg = load_config()
         if "only_when_spotify_running" not in self.cfg:
             self.cfg["only_when_spotify_running"] = True
-            save_config(self.cfg)
         self.api = SpotifyWebAPI(self.cfg)
 
-        # Frameless, always on top, no taskbar icon, no Windows 11 DWM shadow box
+        # Frameless, always on top, tool window, NO system drop shadow / DWM border
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -521,22 +534,26 @@ class SpotifyNowBar(QWidget):
         self.setMouseTracking(True)
         self.resize(self.CANVAS_W, self.CANVAS_H)
 
-        # Pre-created fonts to avoid per-frame allocations on iGPU
-        self._f_badge = QFont("Segoe UI Semibold", 7)
+        # Pre-allocated reusable fonts (avoids per-frame allocation on iGPU)
         self._f_title_c = QFont("Segoe UI Semibold", 10)
         self._f_artist_c = QFont("Segoe UI", 8)
         self._f_title_e = QFont("Segoe UI Semibold", 12)
         self._f_artist_e = QFont("Segoe UI", 9)
+        self._f_badge = QFont("Segoe UI Semibold", 7)
         self._f_small = QFont("Segoe UI", 8)
         self._f_small_b = QFont("Segoe UI Semibold", 8)
         self._f_row_t = QFont("Segoe UI Semibold", 9)
         self._f_row_a = QFont("Segoe UI", 8)
         self._f_arrow = QFont("Segoe UI", 13)
         self._f_rep1 = QFont("Segoe UI Bold", 6)
+        self._f_pod10 = QFont("Segoe UI Bold", 6)
+        self._f_speed = QFont("Segoe UI Semibold", 8)
 
         # Embedded lightweight search input (visible only on Search tab)
         self._search_input = SearchInput(self)
-        self._search_input.setPlaceholderText("Search songs or artists on Spotify... (Enter)")
+        self._search_input.setPlaceholderText(
+            "Search songs or artists on Spotify... (Enter)"
+        )
         self._search_input.setStyleSheet("""
             QLineEdit {
                 background: rgba(255, 255, 255, 18);
@@ -561,14 +578,15 @@ class SpotifyNowBar(QWidget):
         self._search_debounce.timeout.connect(self._run_search_now)
         self._search_input.textChanged.connect(lambda _t: self._search_debounce.start())
 
-        # Playback, Spotify process & API state
+        # Playback, Spotify process & artwork cache
         self.track = TrackState()
         self.extra = SpotifyExtraState(connected=self.api.is_connected)
         self._spotify_running = is_spotify_running()
         self._last_track_key = ""
+        self._cover_pixmap: Optional[QPixmap] = None
+        self._cover_compact: Optional[QPixmap] = None
+        self._cover_expanded: Optional[QPixmap] = None
         self._cover_bytes_hash = 0
-        self._cover_compact_pm: Optional[QPixmap] = None
-        self._cover_expanded_pm: Optional[QPixmap] = None
 
         # Auto-skip filter for "Slide Left to Remove from Queue"
         self._removed_queue_keys: Set[str] = set()
@@ -586,7 +604,7 @@ class SpotifyNowBar(QWidget):
         self._playlist_tracks: List[TrackItem] = []
         self._search_items: List[TrackItem] = []
 
-        # Row swipe/slide state
+        # Row slide gesture state
         self._drag_row_idx = -1
         self._drag_start_x = 0.0
         self._drag_start_y = 0.0
@@ -632,9 +650,30 @@ class SpotifyNowBar(QWidget):
         self._vis_energy = 0.0
         self._marquee_x = 0.0
 
-        # Volume & Action Toast
+        # Jiggle physics & bouncing drawer cascade
+        self._nudge_x = 0.0             # Horizontal skip/seek jiggle spring
+        self._nudge_vx = 0.0
+        self._play_squish = 1.0         # Play/Pause button bounce spring
+        self._play_squish_v = 0.0
+        self._snap_row_idx = -1         # Spring snap-back for cancelled row swipes
+        self._snap_dx = 0.0
+        self._snap_vx = 0.0
+        self._cascade_start = 0.0       # Bouncing staggered drawer row entrance
+
+        # Podcast playback speed tracker
+        self._podcast_speed = 1.0
+
+# Volume & Action Toast
+
         self._toast_text = ""
+
         self._toast_until = 0.0
+
+        # Show the link prompt only once per session for 5 seconds
+
+        self._connect_hint_shown = False
+
+        self._connect_hint_until = 0.0
         self._vol_hud_value = 50
         self._vol_prev_nonzero = 50
         self._vol_debounce = QTimer(self)
@@ -654,7 +693,7 @@ class SpotifyNowBar(QWidget):
         self._peek_timer.setInterval(3500)
         self._peek_timer.timeout.connect(self._on_peek_timeout)
 
-        # Spring & smooth animations
+        # Spring & smooth transitions
         self._drop_anim = QVariantAnimation(self)
         self._drop_anim.valueChanged.connect(self._on_drop_val)
         self._drop_anim.finished.connect(self._on_drop_finished)
@@ -674,24 +713,24 @@ class SpotifyNowBar(QWidget):
         self._color_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
         self._color_anim.valueChanged.connect(self._on_color_val)
 
-        # 30fps visual loop (stopped completely at 0% CPU when hidden)
+        # 30fps animation loop (stops at 0% CPU when hidden)
         self._anim_timer = QTimer(self)
         self._anim_timer.setInterval(33)
         self._anim_timer.timeout.connect(self._on_visual_tick)
 
-        # 60ms top-edge hover sensor
+        # Lightweight cursor edge sensor (60ms)
         self._sensor_timer = QTimer(self)
         self._sensor_timer.setInterval(60)
         self._sensor_timer.timeout.connect(self._poll_top_edge)
         self._sensor_timer.start()
 
-        # Lightweight 1.5s Spotify process watcher
+        # Lightweight Spotify.exe presence & hidden-progress watcher (1.5s)
         self._proc_timer = QTimer(self)
         self._proc_timer.setInterval(1500)
         self._proc_timer.timeout.connect(self._check_spotify_process)
         self._proc_timer.start()
 
-        # Signals & SMTC listener
+        # Signals
         self.smtc_updated.connect(self._handle_smtc)
         self.api_updated.connect(self._handle_api)
         self.drawer_loaded.connect(self._handle_drawer_loaded)
@@ -705,7 +744,6 @@ class SpotifyNowBar(QWidget):
         self.show()
         disable_dwm_frame(int(self.winId()))
 
-        # Apply saved pin mode only if allowed (Spotify running or setting off)
         pin = self.cfg.get("pin_mode", "auto")
         if self._is_bar_allowed() and pin == "compact":
             self._transition_to("compact")
@@ -717,6 +755,7 @@ class SpotifyNowBar(QWidget):
     # --- Spotify Running Guard ---
 
     def _is_bar_allowed(self) -> bool:
+        """Returns False when configured to stay completely hidden while Spotify is closed."""
         if not self.cfg.get("only_when_spotify_running", True):
             return True
         return self._spotify_running or self.track.active
@@ -726,22 +765,23 @@ class SpotifyNowBar(QWidget):
         if running == self._spotify_running:
             return
         self._spotify_running = running
-
         if not self._is_bar_allowed():
             self._edge_hover_since = None
             self._peek_timer.stop()
             self._leave_timer.stop()
-            self._close_drawer()
-            self._set_vol_open(False)
-            self._transition_to("hidden")
-            self.update()
+            if self._state != "hidden":
+                self._transition_to("hidden")
+            else:
+                self._apply_click_through(True)
+                self.update()
         else:
             pin = self.cfg.get("pin_mode", "auto")
-            if pin == "compact":
+            if pin == "compact" and self._state == "hidden":
                 self._transition_to("compact")
-            elif pin == "expanded":
+            elif pin == "expanded" and self._state == "hidden":
                 self._transition_to("expanded")
-            self.update()
+            else:
+                self.update()
 
     # --- Positioning & System Tray ---
 
@@ -789,27 +829,27 @@ class SpotifyNowBar(QWidget):
             pin_menu.addAction(act)
             self._pin_actions[mode] = act
 
+        act_only = QAction(
+            "Hide Completely When Spotify Is Closed", self, checkable=True
+        )
+        act_only.setChecked(bool(self.cfg.get("only_when_spotify_running", True)))
+        act_only.triggered.connect(self._toggle_only_when_running)
+        menu.addAction(act_only)
+
         act_peek = QAction("Auto-Peek on Song Change", self, checkable=True)
         act_peek.setChecked(bool(self.cfg.get("track_peek", True)))
         act_peek.triggered.connect(self._toggle_track_peek)
         menu.addAction(act_peek)
-
-        act_only_sp = QAction(
-            "Hide Completely When Spotify Is Closed", self, checkable=True
-        )
-        act_only_sp.setChecked(bool(self.cfg.get("only_when_spotify_running", True)))
-        act_only_sp.triggered.connect(self._toggle_only_when_running)
-        menu.addAction(act_only_sp)
 
         act_fs = QAction("Pause Hover in Fullscreen Apps", self, checkable=True)
         act_fs.setChecked(bool(self.cfg.get("hide_in_fullscreen", True)))
         act_fs.triggered.connect(self._toggle_fullscreen_guard)
         menu.addAction(act_fs)
 
-        act_startup = QAction("Start with Windows", self, checkable=True)
-        act_startup.setChecked(is_autostart_enabled())
-        act_startup.triggered.connect(self._toggle_autostart)
-        menu.addAction(act_startup)
+        self._act_startup = QAction("Start with Windows", self, checkable=True)
+        self._act_startup.setChecked(get_autostart_enabled())
+        self._act_startup.triggered.connect(self._toggle_autostart)
+        menu.addAction(self._act_startup)
 
         menu.addSeparator()
 
@@ -818,7 +858,7 @@ class SpotifyNowBar(QWidget):
         menu.addAction(act_connect)
 
         act_show = QAction("Drop Down Now", self)
-        act_show.triggered.connect(self._manual_drop_down)
+        act_show.triggered.connect(self._tray_drop_down)
         menu.addAction(act_show)
 
         menu.addSeparator()
@@ -829,17 +869,17 @@ class SpotifyNowBar(QWidget):
 
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(
-            lambda reason: self._manual_drop_down()
+            lambda reason: self._tray_drop_down()
             if reason == QSystemTrayIcon.ActivationReason.Trigger
             else None
         )
         self.tray.show()
 
-    def _manual_drop_down(self) -> None:
-        if self._is_bar_allowed():
-            self._transition_to("expanded")
-        else:
+    def _tray_drop_down(self) -> None:
+        if not self._is_bar_allowed():
             open_spotify_app()
+            return
+        self._transition_to("expanded")
 
     def _set_pin_mode(self, mode: str) -> None:
         self.cfg["pin_mode"] = mode
@@ -870,30 +910,27 @@ class SpotifyNowBar(QWidget):
         }
         self._show_toast(labels.get(nxt, ""))
 
-    def _toggle_track_peek(self, checked: bool) -> None:
-        self.cfg["track_peek"] = checked
-        save_config(self.cfg)
-
     def _toggle_only_when_running(self, checked: bool) -> None:
         self.cfg["only_when_spotify_running"] = checked
         save_config(self.cfg)
         if not self._is_bar_allowed():
             self._transition_to("hidden")
         else:
-            pin = self.cfg.get("pin_mode", "auto")
-            if pin in ("compact", "expanded"):
-                self._transition_to(pin)
-        self.update()
+            self.update()
+
+    def _toggle_track_peek(self, checked: bool) -> None:
+        self.cfg["track_peek"] = checked
+        save_config(self.cfg)
 
     def _toggle_fullscreen_guard(self, checked: bool) -> None:
         self.cfg["hide_in_fullscreen"] = checked
         save_config(self.cfg)
 
     def _toggle_autostart(self, checked: bool) -> None:
-        ok = set_autostart_enabled(checked)
-        if ok:
-            self._show_toast(
-                "Start with Windows: On" if checked else "Start with Windows: Off"
+        if not set_autostart_enabled(checked):
+            self._act_startup.setChecked(not checked)
+            QMessageBox.warning(
+                self, "Startup", "Could not update Windows Startup registry entry."
             )
 
     def _open_connect_dialog(self) -> None:
@@ -901,7 +938,10 @@ class SpotifyNowBar(QWidget):
         if dlg.exec():
             self._sync_web_api_async(include_queue=True)
             if self._drawer_tab:
-                self._load_drawer_data(self._drawer_tab)
+                if self._drawer_tab == "search":
+                    self._run_search_now()
+                else:
+                    self._load_drawer_data(self._drawer_tab)
 
     def _quit_app(self) -> None:
         self.smtc.stop()
@@ -928,6 +968,7 @@ class SpotifyNowBar(QWidget):
         self._drawer_scroll = 0.0
         self._active_playlist = None
         self._drawer_status = ""
+        self._cascade_start = time.monotonic()
 
         self._drawer_anim.stop()
         self._drawer_anim.setStartValue(self._drawer_p)
@@ -968,9 +1009,8 @@ class SpotifyNowBar(QWidget):
             self._search_input.setGeometry(sx, sy, sw, 32)
             if not self._search_input.isVisible():
                 self._search_input.show()
-        else:
-            if self._search_input.isVisible():
-                self._search_input.hide()
+        elif self._search_input.isVisible():
+            self._search_input.hide()
 
     def _load_drawer_data(self, tab: str) -> None:
         self._drawer_loading = True
@@ -1032,6 +1072,7 @@ class SpotifyNowBar(QWidget):
     def _handle_drawer_loaded(self, kind: str, items: List[TrackItem], err: str) -> None:
         self._drawer_loading = False
         self._drawer_status = err
+        self._cascade_start = time.monotonic()
         if kind == "queue":
             self.extra.queue_items = items
         elif kind == "liked":
@@ -1068,7 +1109,7 @@ class SpotifyNowBar(QWidget):
 
     def _transition_to(self, target: str) -> None:
         if target != "hidden" and not self._is_bar_allowed():
-            target = "hidden"
+            return
         if target == self._state:
             return
         prev = self._state
@@ -1112,8 +1153,17 @@ class SpotifyNowBar(QWidget):
             self._expand_anim.setEndValue(target_exp)
             self._expand_anim.start()
 
-        if target == "expanded" and self.api.is_connected:
-            self._sync_web_api_async(include_queue=True)
+        if target == "expanded":
+
+            if not self.api.is_connected and not self._connect_hint_shown:
+
+                self._connect_hint_shown = True
+
+                self._connect_hint_until = time.monotonic() + 5.0
+
+            if self.api.is_connected:
+
+                self._sync_web_api_async(include_queue=True)
 
         self.update()
 
@@ -1126,7 +1176,7 @@ class SpotifyNowBar(QWidget):
         if self._state == "hidden" and self._drop_p <= 0.01:
             self._drop_p = 0.0
             self._apply_click_through(True)
-            self._anim_timer.stop()
+            self._anim_timer.stop()  # 0% CPU when hidden
             self.update()
 
     def _on_expand_val(self, val: float) -> None:
@@ -1140,7 +1190,7 @@ class SpotifyNowBar(QWidget):
         self.update()
 
     def _set_vol_open(self, open_now: bool) -> None:
-        """Smoothly slides open or closes the floating hover volume slider capsule."""
+        """Smoothly expands or collapses the floating hover volume slider pill."""
         if open_now and not self.api.is_connected:
             return
         if open_now:
@@ -1184,6 +1234,35 @@ class SpotifyNowBar(QWidget):
         target_vis = 1.0 if self.track.is_playing else 0.0
         self._vis_energy += (target_vis - self._vis_energy) * 0.14
         self._marquee_x += 0.72
+
+        # Horizontal skip/seek jiggle spring
+        if abs(self._nudge_x) > 0.04 or abs(self._nudge_vx) > 0.04:
+            self._nudge_vx += -0.26 * self._nudge_x
+            self._nudge_vx *= 0.68
+            self._nudge_x += self._nudge_vx
+        else:
+            self._nudge_x = 0.0
+            self._nudge_vx = 0.0
+
+        # Play/Pause button bounce spring
+        if abs(self._play_squish - 1.0) > 0.004 or abs(self._play_squish_v) > 0.004:
+            self._play_squish_v += -0.34 * (self._play_squish - 1.0)
+            self._play_squish_v *= 0.64
+            self._play_squish += self._play_squish_v
+        else:
+            self._play_squish = 1.0
+            self._play_squish_v = 0.0
+
+        # Spring snap-back for cancelled row swipes
+        if self._snap_row_idx >= 0:
+            self._snap_vx += -0.30 * self._snap_dx
+            self._snap_vx *= 0.64
+            self._snap_dx += self._snap_vx
+            if abs(self._snap_dx) < 0.6 and abs(self._snap_vx) < 0.6:
+                self._snap_row_idx = -1
+                self._snap_dx = 0.0
+                self._snap_vx = 0.0
+
         self.update()
 
     # --- Top-Center Edge Hover Sensor ---
@@ -1192,7 +1271,7 @@ class SpotifyNowBar(QWidget):
         w = lerp(self.PILL_W, self.CARD_W, self._expand_p)
         base_h = lerp(self.PILL_H, self.CARD_H, self._expand_p)
         h = base_h + (self.DRAWER_H * self._drawer_p * self._expand_p)
-        x = (self.CANVAS_W - w) / 2.0
+        x = (self.CANVAS_W - w) / 2.0 + self._nudge_x
         y = lerp(-base_h - 8.0, float(self.TOP_MARGIN), self._drop_p)
         return QRectF(x, y, w, h)
 
@@ -1200,20 +1279,21 @@ class SpotifyNowBar(QWidget):
         if not self._is_bar_allowed():
             self._edge_hover_since = None
             return
-
         screen = QApplication.primaryScreen()
         if not screen:
             return
         geo = screen.geometry()
         pos = QCursor.pos()
         cx = geo.x() + geo.width() // 2
-        in_top_zone = (geo.y() <= pos.y() <= geo.y() + 6) and (abs(pos.x() - cx) <= 125)
+        in_top_zone = (geo.y() <= pos.y() <= geo.y() + 6) and (
+            abs(pos.x() - cx) <= 125
+        )
 
         if self._state == "hidden":
             if in_top_zone:
-                if self.cfg.get("hide_in_fullscreen", True) and is_foreground_fullscreen(
-                    int(self.winId())
-                ):
+                if self.cfg.get(
+                    "hide_in_fullscreen", True
+                ) and is_foreground_fullscreen(int(self.winId())):
                     self._edge_hover_since = None
                     return
                 now = time.monotonic()
@@ -1241,7 +1321,7 @@ class SpotifyNowBar(QWidget):
             active_rect = self._card_rect().adjusted(-20, -22, 20, 20)
             inside = active_rect.contains(QPointF(local_pt)) or in_top_zone
 
-            # Auto-collapse volume popover when cursor moves off its zone
+            # Auto-collapse volume slider if cursor leaves its popover zone
             if self._vol_open and not self._dragging_vol:
                 lp = QPointF(local_pt)
                 in_vol_zone = (
@@ -1290,13 +1370,14 @@ class SpotifyNowBar(QWidget):
 
         pm = QPixmap()
         if pm.loadFromData(img_bytes):
-            self._cover_compact_pm = pm.scaled(
+            self._cover_pixmap = pm
+            self._cover_compact = pm.scaled(
                 80,
                 80,
                 Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                 Qt.TransformationMode.SmoothTransformation,
             )
-            self._cover_expanded_pm = pm.scaled(
+            self._cover_expanded = pm.scaled(
                 144,
                 144,
                 Qt.AspectRatioMode.KeepAspectRatioByExpanding,
@@ -1316,7 +1397,7 @@ class SpotifyNowBar(QWidget):
         track_changed = state.active and (state.track_key != self._last_track_key)
         self.track = state
 
-        if state.active and not self._spotify_running:
+        if state.active:
             self._spotify_running = True
 
         if state.thumbnail_bytes:
@@ -1438,7 +1519,7 @@ class SpotifyNowBar(QWidget):
                 hovered = name
                 break
 
-        # Open/hold hover volume popover over speaker icon or expanded capsule
+        # Open/hold the volume slider smoothly when hovering speaker icon or popover
         if self._expand_p > 0.8 and self.api.is_connected:
             in_vol = (
                 "vol_mute" in self._hitboxes
@@ -1555,6 +1636,11 @@ class SpotifyNowBar(QWidget):
                         self._on_row_slide_right(item)
                     elif dx <= -72:
                         self._on_row_slide_left(item)
+                    else:
+                        # Elastic spring snap-back if released before trigger threshold
+                        self._snap_row_idx = idx
+                        self._snap_dx = dx
+                        self._snap_vx = 0.0
                 else:
                     self._on_row_click(item)
             self.update()
@@ -1568,15 +1654,18 @@ class SpotifyNowBar(QWidget):
             return
         pt = event.position()
 
+        # Scroll drawer list if cursor is over the drawer
         if self._drawer_p > 0.7 and self._list_viewport.contains(pt):
             items = self._current_drawer_items()
-            max_scroll = max(0.0, len(items) * self.ROW_H - self._list_viewport.height())
+            max_scroll = max(
+                0.0, len(items) * self.ROW_H - self._list_viewport.height()
+            )
             step = -38.0 if event.angleDelta().y() > 0 else 38.0
             self._drawer_scroll = max(0.0, min(max_scroll, self._drawer_scroll + step))
             self.update()
             return
 
-        # Scroll adjusts Spotify app volume and briefly opens the hover slider
+        # Scroll adjusts Spotify app volume directly and peeks the hover slider
         if not self.api.is_connected:
             return
         delta = 5 if event.angleDelta().y() > 0 else -5
@@ -1593,6 +1682,67 @@ class SpotifyNowBar(QWidget):
     def _flush_volume_api(self) -> None:
         val = self._vol_hud_value
         threading.Thread(target=self.api.set_volume, args=(val,), daemon=True).start()
+
+    def _seek_relative_ms(self, delta_ms: int) -> None:
+        """Jumps forward/backward by delta_ms (e.g., -10s / +10s for podcasts)."""
+        if not self.track.active:
+            return
+        cur = self._live_position_ms()
+        dur = self.track.duration_ms
+        target = max(0, cur + delta_ms)
+        if dur > 0:
+            target = min(dur, target)
+        self.track.position_ms = target
+        self.track.updated_at = time.monotonic()
+        self._nudge_vx = 2.8 if delta_ms > 0 else -2.8
+        sec = abs(delta_ms) // 1000
+        self._show_toast(f"Skipped +{sec}s" if delta_ms > 0 else f"Rewound -{sec}s")
+        if self.api.is_connected:
+            threading.Thread(
+                target=self.api.seek_ms, args=(target,), daemon=True
+            ).start()
+        else:
+            self.smtc.seek_ms(target)
+        self.update()
+
+    def _cycle_podcast_speed(self) -> None:
+        """Attempts native SMTC playback rate change; informs cleanly if Spotify locks it."""
+        speeds = [0.8, 1.0, 1.2, 1.5, 1.8, 2.0]
+        cur_idx = min(
+            range(len(speeds)), key=lambda i: abs(speeds[i] - self._podcast_speed)
+        )
+        next_rate = speeds[(cur_idx + 1) % len(speeds)]
+
+        session = getattr(self.smtc, "_session", None)
+        loop = getattr(self.smtc, "_loop", None)
+        if not session or not loop or not loop.is_running():
+            self._show_toast("Spotify locks speed to in-app control • Double-click cover")
+            return
+
+        async def _try_rate():
+            try:
+                pb = session.get_playback_info()
+                controls = pb.controls if pb else None
+                if (
+                    controls
+                    and getattr(controls, "is_playback_rate_enabled", False)
+                    and hasattr(session, "try_change_playback_rate_async")
+                ):
+                    ok = await session.try_change_playback_rate_async(float(next_rate))
+                    if ok:
+                        self._podcast_speed = next_rate
+                        self.toast_signal.emit(f"Podcast Speed: {next_rate:g}x")
+                        return
+            except Exception:
+                pass
+            self.toast_signal.emit(
+                "Spotify locks speed to in-app control • Double-click cover"
+            )
+
+        try:
+            asyncio.run_coroutine_threadsafe(_try_rate(), loop)
+        except Exception:
+            self._show_toast("Spotify locks speed to in-app control • Double-click cover")
 
     # --- Row Click & Slide Actions ---
 
@@ -1664,11 +1814,25 @@ class SpotifyNowBar(QWidget):
 
     def _trigger_action(self, name: str) -> None:
         if name == "play":
+            self._play_squish = 0.84
+            self._play_squish_v = 0.0
             self.smtc.toggle_play_pause()
         elif name == "next":
+            self._nudge_vx = 3.2
             self.smtc.next_track()
         elif name == "prev":
+            self._nudge_vx = -3.2
             self.smtc.previous_track()
+        elif name == "seek_back_10":
+            mods = QApplication.keyboardModifiers()
+            step = -30_000 if (mods & Qt.KeyboardModifier.ShiftModifier) else -10_000
+            self._seek_relative_ms(step)
+        elif name == "seek_fwd_10":
+            mods = QApplication.keyboardModifiers()
+            step = 30_000 if (mods & Qt.KeyboardModifier.ShiftModifier) else 10_000
+            self._seek_relative_ms(step)
+        elif name == "pod_speed":
+            self._cycle_podcast_speed()
         elif name == "pin":
             self._cycle_pin_mode()
         elif name == "connect":
@@ -1711,7 +1875,11 @@ class SpotifyNowBar(QWidget):
                 prev_liked = self.extra.is_liked
                 self.extra.is_liked = not prev_liked
                 self._show_toast(
-                    "Added to Liked Songs"
+                    "Saved Episode"
+                    if (not prev_liked and self.extra.is_podcast)
+                    else "Removed Episode"
+                    if (prev_liked and self.extra.is_podcast)
+                    else "Added to Liked Songs"
                     if not prev_liked
                     else "Removed from Liked Songs"
                 )
@@ -1752,14 +1920,10 @@ class SpotifyNowBar(QWidget):
         self._list_viewport = QRectF()
         self._vol_pill_rect = QRectF()
 
-        # Stay completely invisible when Spotify is closed
-        if not self._is_bar_allowed() and self._drop_p <= 0.01:
-            return
-
-        # 1) Retracted 3.5px top-center dynamic glow bar (click-through)
+        # 1) Retracted 3.5px top-center dynamic glow indicator (click-through)
         if self._drop_p < 0.25 and self._is_bar_allowed():
             edge_alpha = (1.0 - self._drop_p / 0.25) * (
-                0.88 if self.track.active else 0.34
+                0.88 if self.track.active else 0.32
             )
             bar_w = 88.0 if self.track.is_playing else 58.0
             bar_x = (self.CANVAS_W - bar_w) / 2.0
@@ -1777,7 +1941,7 @@ class SpotifyNowBar(QWidget):
         opacity = max(0.0, min(1.0, self._drop_p * 1.45))
         p.setOpacity(opacity)
 
-        # 2) Soft layered drop shadow (painted inside transparent canvas)
+        # 2) Soft layered drop shadow (drawn inside transparent widget, zero DWM box)
         for i, spread in enumerate((11, 6, 2)):
             sh = QColor(0, 0, 0, 24 + i * 20)
             p.setBrush(sh)
@@ -1788,7 +1952,7 @@ class SpotifyNowBar(QWidget):
                 radius + spread * 0.5,
             )
 
-        # 3) Frosted dark glass body with dynamic album-art ambient glow
+        # 3) Frosted dark glass body with clean album-art radial glow
         clip = QPainterPath()
         clip.addRoundedRect(rect, radius, radius)
         p.save()
@@ -1829,7 +1993,7 @@ class SpotifyNowBar(QWidget):
 
         p.restore()
 
-        # Crisp 1px glass border
+        # Crisp 1px outer glass border
         p.setOpacity(opacity)
         p.setPen(QPen(QColor(255, 255, 255, 36), 1.0))
         p.setBrush(Qt.BrushStyle.NoBrush)
@@ -1842,7 +2006,9 @@ class SpotifyNowBar(QWidget):
         path = QPainterPath()
         path.addRoundedRect(r, radius, radius)
         p.setClipPath(path)
-        pm = self._cover_compact_pm if compact else self._cover_expanded_pm
+        pm = self._cover_compact if compact else self._cover_expanded
+        if pm is None:
+            pm = self._cover_pixmap
         if pm and not pm.isNull():
             p.drawPixmap(r, pm, QRectF(pm.rect()))
         else:
@@ -1944,9 +2110,17 @@ class SpotifyNowBar(QWidget):
         self._draw_rounded_art(p, art_r, 20.0, compact=True)
         self._hitboxes["art"] = art_r
 
-        title = self.track.title if self.track.active else "Spotify Idle"
+        title = (
+            self.extra.episode_title
+            if (self.extra.is_podcast and self.extra.episode_title)
+            else self.track.title
+            if self.track.active
+            else "Spotify Idle"
+        )
         artist = (
-            self.track.artist
+            self.extra.show_name
+            if (self.extra.is_podcast and self.extra.show_name)
+            else self.track.artist
             if self.track.active
             else "Play a track to light up Now Bar"
         )
@@ -1986,7 +2160,7 @@ class SpotifyNowBar(QWidget):
             QRectF(knob_x, cy - 2.0, max(0.0, bar_r.right() - knob_x), 4.0), 2.0, 2.0
         )
 
-        # Animated wavy progress track
+        # Animated wavy played segment
         if fill_w > 2.0:
             if self._wave_amp > 0.05 and fill_w > 8.0:
                 path = QPainterPath()
@@ -2007,10 +2181,8 @@ class SpotifyNowBar(QWidget):
                         path.lineTo(x, y)
 
                 glow_c = QColor(self._accent_cur)
-                glow_c.setAlpha(70)
-                p.setPen(
-                    QPen(glow_c, 6.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
-                )
+                glow_c.setAlpha(68)
+                p.setPen(QPen(glow_c, 6.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
                 p.setBrush(Qt.BrushStyle.NoBrush)
                 p.drawPath(path)
 
@@ -2028,7 +2200,7 @@ class SpotifyNowBar(QWidget):
                 p.setBrush(self._accent_cur)
                 p.drawRoundedRect(QRectF(bar_r.left(), cy - 2.2, fill_w, 4.4), 2.2, 2.2)
 
-        # One UI pill thumb
+        # One UI playhead pill thumb
         active_thumb = self._hover_btn == "seek" or self._seeking
         tw = 6.0 if active_thumb else 4.2
         th = 16.0 if active_thumb else 12.0
@@ -2044,40 +2216,40 @@ class SpotifyNowBar(QWidget):
         self._draw_rounded_art(p, art_r, 15.0, compact=False)
         self._hitboxes["art"] = art_r
 
-        meta_x = art_r.right() + 15
-        meta_w = rect.width() - 180
+        meta_x = art_r.right() + 15.0
+        meta_w = rect.width() - 180.0
 
-        badge_text = "SPOTIFY HYBRID" if self.api.is_connected else "SPOTIFY LOCAL"
-        p.setFont(self._f_badge)
-        bw = QFontMetrics(self._f_badge).horizontalAdvance(badge_text) + 14
-        badge_r = QRectF(meta_x, rect.top() + 19, bw, 17)
-        bc = QColor(self._accent_cur)
-        bc.setAlpha(44)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(bc)
-        p.drawRoundedRect(badge_r, 8.5, 8.5)
-        p.setPen(self._accent_cur)
-        p.drawText(badge_r, Qt.AlignmentFlag.AlignCenter, badge_text)
-
-        if self.track.active:
-            self._draw_mini_eq(p, badge_r.right() + 9, badge_r.center().y())
-
-        title = self.track.title if self.track.active else "Spotify Not Playing"
-        artist = (
-            self.track.artist
+        title = (
+            self.extra.episode_title
+            if (self.extra.is_podcast and self.extra.episode_title)
+            else self.track.title
             if self.track.active
-            else "Double-click cover to open Spotify"
+            else "Spotify Not Playing"
         )
+        if self.extra.is_podcast:
+            artist = (
+                f"Podcast • {self.extra.show_name}"
+                if self.extra.show_name
+                else "Podcast"
+            )
+        else:
+            artist = (
+                self.track.artist
+                if self.track.active
+                else "Double-click cover to open Spotify"
+            )
+
+        # Clean vertically centered Title & Artist (no status badge clutter)
         self._draw_marquee_text(
             p,
-            QRectF(meta_x, rect.top() + 40, meta_w, 25),
+            QRectF(meta_x, rect.top() + 29, meta_w, 26),
             title,
             self._f_title_e,
             QColor(255, 255, 255),
         )
         self._draw_marquee_text(
             p,
-            QRectF(meta_x, rect.top() + 65, meta_w, 20),
+            QRectF(meta_x, rect.top() + 56, meta_w, 20),
             artist,
             self._f_artist_e,
             QColor(192, 204, 220),
@@ -2102,7 +2274,7 @@ class SpotifyNowBar(QWidget):
             accent_override=QColor(29, 215, 96) if self.extra.is_liked else None,
         )
 
-        # Animated Wavy Seek Bar + Timestamps
+        # Animated Wavy Seek Bar + Timestamps (auto-expands width for 1hr+ podcasts)
         seek_y = rect.top() + 111
         dur = self.track.duration_ms
         pos = self._live_position_ms()
@@ -2113,7 +2285,11 @@ class SpotifyNowBar(QWidget):
         )
         ratio = max(0.0, min(1.0, ratio))
 
-        bar_r = QRectF(rect.left() + 58, seek_y - 3.0, rect.width() - 116, 6.0)
+        ts_w = 48.0 if dur >= 3_600_000 else 38.0
+        bar_pad = ts_w + 20.0
+        bar_r = QRectF(
+            rect.left() + bar_pad, seek_y - 3.0, rect.width() - bar_pad * 2.0, 6.0
+        )
         self._hitboxes["seek"] = bar_r.adjusted(0, -8, 0, 8)
         self._paint_animated_slider(p, bar_r, ratio)
 
@@ -2121,36 +2297,34 @@ class SpotifyNowBar(QWidget):
         p.setPen(QColor(178, 192, 210))
         disp_pos = int(ratio * dur) if self._seeking else pos
         p.drawText(
-            QRectF(rect.left() + 15, seek_y - 9, 38, 18),
+            QRectF(rect.left() + 14, seek_y - 9, ts_w, 18),
             Qt.AlignmentFlag.AlignCenter,
             fmt_time(disp_pos),
         )
         p.drawText(
-            QRectF(rect.right() - 53, seek_y - 9, 38, 18),
+            QRectF(rect.right() - ts_w - 14, seek_y - 9, ts_w, 18),
             Qt.AlignmentFlag.AlignCenter,
             fmt_time(dur),
         )
 
-        # Transport Row: Shuffle | Prev | Play/Pause | Next | Repeat | Hover Volume
+        # Transport Row: Music Mode OR Podcast Mode + Hover Volume Popover
         ctrl_y = rect.top() + 149
         cx = rect.center().x()
 
         play_r = QRectF(cx - 21, ctrl_y - 21, 42, 42)
-        prev_r = QRectF(cx - 80, ctrl_y - 17, 34, 34)
-        next_r = QRectF(cx + 46, ctrl_y - 17, 34, 34)
-        shuf_r = QRectF(cx - 138, ctrl_y - 16, 32, 32)
-        rep_r = QRectF(cx + 106, ctrl_y - 16, 32, 32)
+        left_inner_r = QRectF(cx - 80, ctrl_y - 17, 34, 34)
+        right_inner_r = QRectF(cx + 46, ctrl_y - 17, 34, 34)
+        left_outer_r = QRectF(cx - 142, ctrl_y - 15, 38, 30)
+        right_outer_r = QRectF(cx + 106, ctrl_y - 16, 32, 32)
 
         vol_covering = self._vol_open_p > 0.25
         self._hitboxes["play"] = play_r
-        self._hitboxes["prev"] = prev_r
-        if not vol_covering:
-            self._hitboxes["next"] = next_r
-        if self.api.is_connected:
-            self._hitboxes["shuffle"] = shuf_r
-            if not vol_covering:
-                self._hitboxes["repeat"] = rep_r
 
+        # Squishy spring Play/Pause button
+        p.save()
+        p.translate(play_r.center())
+        p.scale(self._play_squish, self._play_squish)
+        p.translate(-play_r.center())
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(255, 255, 255, 248 if self._hover_btn == "play" else 232))
         p.drawEllipse(play_r)
@@ -2160,27 +2334,83 @@ class SpotifyNowBar(QWidget):
             "pause" if self.track.is_playing else "play",
             QColor(14, 16, 20),
         )
+        p.restore()
 
-        self._draw_icon_btn(p, prev_r, "prev", hovered=(self._hover_btn == "prev"))
-        self._draw_icon_btn(
-            p, next_r, "next", hovered=(self._hover_btn == "next" and not vol_covering)
-        )
-        self._draw_icon_btn(
-            p,
-            shuf_r,
-            "shuffle",
-            active=self.extra.shuffle,
-            hovered=(self._hover_btn == "shuffle"),
-            dimmed=not self.api.is_connected,
-        )
-        self._draw_icon_btn(
-            p,
-            rep_r,
-            "repeat1" if self.extra.repeat == "track" else "repeat",
-            active=(self.extra.repeat != "off"),
-            hovered=(self._hover_btn == "repeat" and not vol_covering),
-            dimmed=not self.api.is_connected,
-        )
+        if self.extra.is_podcast:
+            # Podcast Controls: Speed | -10s | Play/Pause | +10s | Next Ep
+            self._hitboxes["pod_speed"] = left_outer_r
+            self._hitboxes["seek_back_10"] = left_inner_r
+            if not vol_covering:
+                self._hitboxes["seek_fwd_10"] = right_inner_r
+                self._hitboxes["next"] = right_outer_r
+
+            sp_hov = self._hover_btn == "pod_speed"
+            sp_active = abs(self._podcast_speed - 1.0) > 0.05
+            p.setPen(Qt.PenStyle.NoPen)
+            if sp_active:
+                sp_bg = QColor(self._accent_cur)
+                sp_bg.setAlpha(64)
+            else:
+                sp_bg = QColor(255, 255, 255, 30 if sp_hov else 16)
+            p.setBrush(sp_bg)
+            p.drawRoundedRect(left_outer_r, 12.0, 12.0)
+            p.setFont(self._f_speed)
+            p.setPen(self._accent_cur if sp_active else QColor(235, 242, 250))
+            p.drawText(
+                left_outer_r, Qt.AlignmentFlag.AlignCenter, f"{self._podcast_speed:g}x"
+            )
+
+            self._draw_icon_btn(
+                p, left_inner_r, "back10", hovered=(self._hover_btn == "seek_back_10")
+            )
+            self._draw_icon_btn(
+                p,
+                right_inner_r,
+                "fwd10",
+                hovered=(self._hover_btn == "seek_fwd_10" and not vol_covering),
+            )
+            self._draw_icon_btn(
+                p,
+                right_outer_r,
+                "next",
+                hovered=(self._hover_btn == "next" and not vol_covering),
+            )
+        else:
+            # Music Controls: Shuffle | Prev | Play/Pause | Next | Repeat
+            shuf_r = QRectF(cx - 138, ctrl_y - 16, 32, 32)
+            self._hitboxes["prev"] = left_inner_r
+            if not vol_covering:
+                self._hitboxes["next"] = right_inner_r
+            if self.api.is_connected:
+                self._hitboxes["shuffle"] = shuf_r
+                if not vol_covering:
+                    self._hitboxes["repeat"] = right_outer_r
+
+            self._draw_icon_btn(
+                p, left_inner_r, "prev", hovered=(self._hover_btn == "prev")
+            )
+            self._draw_icon_btn(
+                p,
+                right_inner_r,
+                "next",
+                hovered=(self._hover_btn == "next" and not vol_covering),
+            )
+            self._draw_icon_btn(
+                p,
+                shuf_r,
+                "shuffle",
+                active=self.extra.shuffle,
+                hovered=(self._hover_btn == "shuffle"),
+                dimmed=not self.api.is_connected,
+            )
+            self._draw_icon_btn(
+                p,
+                right_outer_r,
+                "repeat1" if self.extra.repeat == "track" else "repeat",
+                active=(self.extra.repeat != "off"),
+                hovered=(self._hover_btn == "repeat" and not vol_covering),
+                dimmed=not self.api.is_connected,
+            )
 
         # Hover-Expandable Spotify App Volume Popover (slides left from speaker icon)
         vol_val = max(0, min(100, self._vol_hud_value))
@@ -2205,14 +2435,11 @@ class SpotifyNowBar(QWidget):
             )
             self._vol_pill_rect = pill_r
 
-            # Frosted capsule backdrop over the right half of the transport row
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(0, 0, 0, int(90 * self._vol_open_p)))
             p.drawRoundedRect(pill_r.adjusted(-2, 2, 2, 4), 18.0, 18.0)
 
-            p.setBrush(
-                QColor(18, 21, 28, int(248 * min(1.0, self._vol_open_p * 1.4)))
-            )
+            p.setBrush(QColor(18, 21, 28, int(248 * min(1.0, self._vol_open_p * 1.4))))
             p.setPen(QPen(QColor(255, 255, 255, int(46 * self._vol_open_p)), 1.0))
             p.drawRoundedRect(pill_r, 18.0, 18.0)
 
@@ -2276,7 +2503,7 @@ class SpotifyNowBar(QWidget):
         if time.monotonic() < self._toast_until and self._toast_text:
             toast_r = QRectF(rect.left() + 20, tab_y + 2, rect.width() - 40, 26)
             tc = QColor(self._accent_cur)
-            tc.setAlpha(42)
+            tc.setAlpha(44)
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(tc)
             p.drawRoundedRect(toast_r, 13, 13)
@@ -2284,19 +2511,24 @@ class SpotifyNowBar(QWidget):
             p.setPen(QColor(245, 252, 248))
             p.drawText(toast_r, Qt.AlignmentFlag.AlignCenter, self._toast_text)
         elif not self.api.is_connected:
-            conn_r = QRectF(rect.left() + 20, tab_y + 2, rect.width() - 40, 26)
-            self._hitboxes["connect"] = conn_r
-            p.setFont(self._f_small)
-            p.setPen(
-                self._accent_cur
-                if self._hover_btn == "connect"
-                else QColor(166, 180, 198)
-            )
-            p.drawText(
-                conn_r,
-                Qt.AlignmentFlag.AlignCenter,
-                "Click to link Spotify Platinum (Queue • Liked • Search • Volume)",
-            )
+            rem = self._connect_hint_until - time.monotonic()
+            if rem > 0.0:
+                conn_r = QRectF(rect.left() + 20, tab_y + 2, rect.width() - 40, 26)
+                self._hitboxes["connect"] = conn_r
+                p.save()
+                p.setOpacity(p.opacity() * min(1.0, rem / 0.6))
+                p.setFont(self._f_small)
+                p.setPen(
+                    self._accent_cur
+                    if self._hover_btn == "connect"
+                    else QColor(166, 180, 198)
+                )
+                p.drawText(
+                    conn_r,
+                    Qt.AlignmentFlag.AlignCenter,
+                    "Click to link Spotify Premium (Queue • Liked • Search • Volume)",
+                )
+                p.restore()
         else:
             tabs = [
                 ("tab_queue", "Queue"),
@@ -2415,12 +2647,10 @@ class SpotifyNowBar(QWidget):
                 msg,
             )
 
-            # Actionable Retry or Re-link button if an API error occurs
+            # Actionable Retry / Re-link button on errors
             if not self._drawer_loading and self._drawer_status:
                 low = self._drawer_status.lower()
-                is_relink = (
-                    "re-link" in low or "permission" in low or "expired" in low
-                )
+                is_relink = "re-link" in low or "permission" in low or "expired" in low
                 btn_key = "connect" if is_relink else "drawer_retry"
                 btn_lbl = "Re-link Spotify" if is_relink else "↻ Retry"
                 btn_w = 132.0 if is_relink else 96.0
@@ -2445,18 +2675,32 @@ class SpotifyNowBar(QWidget):
         p.setClipRect(vp)
         fm_t = QFontMetrics(self._f_row_t)
         fm_a = QFontMetrics(self._f_row_a)
+        now_t = time.monotonic()
+        base_opacity = p.opacity()
 
         for idx, item in enumerate(items):
             ry = vp.top() + idx * self.ROW_H - self._drawer_scroll
             if ry + self.ROW_H < vp.top() or ry > vp.bottom():
                 continue
 
-            row_r = QRectF(vp.left() + 2, ry + 3, vp.width() - 4, self.ROW_H - 6)
-            dx = (
-                self._drag_dx
-                if (self._dragging_row and idx == self._drag_row_idx)
-                else 0.0
+            # Staggered 24ms bouncing cascade entrance animation
+            row_delay = min(idx, 7) * 0.024
+            ct = max(0.0, min(1.0, (now_t - self._cascade_start - row_delay) / 0.28))
+            s = 1.4
+            u = ct - 1.0
+            c_bounce = 1.0 + (s + 1.0) * (u ** 3) + s * (u ** 2)
+            cascade_dy = (1.0 - c_bounce) * 18.0
+            p.setOpacity(base_opacity * min(1.0, ct * 1.6))
+
+            row_r = QRectF(
+                vp.left() + 2, ry + 3 + cascade_dy, vp.width() - 4, self.ROW_H - 6
             )
+            if self._dragging_row and idx == self._drag_row_idx:
+                dx = self._drag_dx
+            elif idx == self._snap_row_idx:
+                dx = self._snap_dx
+            else:
+                dx = 0.0
 
             if abs(dx) > 4:
                 if dx > 0:
@@ -2468,9 +2712,10 @@ class SpotifyNowBar(QWidget):
                     )
                     align = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
                 else:
+                    is_destructive = self._drawer_tab in ("queue", "liked")
                     bg_c = (
                         QColor(239, 68, 68, int(min(220, abs(dx) * 2.1)))
-                        if self._drawer_tab in ("queue", "liked")
+                        if is_destructive
                         else QColor(236, 72, 153, int(min(220, abs(dx) * 2.1)))
                     )
                     if self._drawer_tab == "queue":
@@ -2500,9 +2745,7 @@ class SpotifyNowBar(QWidget):
             p.setFont(self._f_small_b)
             p.setPen(self._accent_cur if is_hov else QColor(148, 163, 184))
             p.drawText(
-                num_r,
-                Qt.AlignmentFlag.AlignCenter,
-                "♫" if item.is_playlist else str(idx + 1),
+                num_r, Qt.AlignmentFlag.AlignCenter, "♫" if item.is_playlist else str(idx + 1)
             )
 
             tx = num_r.right() + 6
@@ -2687,6 +2930,33 @@ class SpotifyNowBar(QWidget):
                     "1",
                 )
 
+        elif name in ("back10", "fwd10"):
+            # Crisp podcast -10s / +10s circular arrow + "10" label
+            pen = QPen(
+                color,
+                1.7,
+                Qt.PenStyle.SolidLine,
+                Qt.PenCapStyle.RoundCap,
+                Qt.PenJoinStyle.RoundJoin,
+            )
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            arc_r = QRectF(cx - 7.8, cy - 7.8, 15.6, 15.6)
+            if name == "back10":
+                p.drawArc(arc_r, 90 * 16, -295 * 16)
+                p.drawLine(QPointF(cx - 0.5, cy - 7.8), QPointF(cx - 4.0, cy - 10.4))
+                p.drawLine(QPointF(cx - 0.5, cy - 7.8), QPointF(cx - 3.6, cy - 4.5))
+            else:
+                p.drawArc(arc_r, 90 * 16, 295 * 16)
+                p.drawLine(QPointF(cx + 0.5, cy - 7.8), QPointF(cx + 4.0, cy - 10.4))
+                p.drawLine(QPointF(cx + 0.5, cy - 7.8), QPointF(cx + 3.6, cy - 4.5))
+            p.setFont(self._f_pod10)
+            p.drawText(
+                QRectF(cx - 7.0, cy - 5.2, 14.0, 11.0),
+                Qt.AlignmentFlag.AlignCenter,
+                "10",
+            )
+
         elif name in ("vol_mute", "vol_low", "vol_high"):
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(color)
@@ -2700,12 +2970,7 @@ class SpotifyNowBar(QWidget):
             sp.closeSubpath()
             p.drawPath(sp)
 
-            pen = QPen(
-                color,
-                1.6,
-                Qt.PenStyle.SolidLine,
-                Qt.PenCapStyle.RoundCap,
-            )
+            pen = QPen(color, 1.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
             p.setPen(pen)
             p.setBrush(Qt.BrushStyle.NoBrush)
             if name == "vol_mute":
@@ -2714,15 +2979,13 @@ class SpotifyNowBar(QWidget):
             else:
                 p.drawArc(QRectF(cx - 0.5, cy - 3.6, 5.2, 7.2), -55 * 16, 110 * 16)
                 if name == "vol_high":
-                    p.drawArc(
-                        QRectF(cx - 1.2, cy - 6.0, 9.2, 12.0), -55 * 16, 110 * 16
-                    )
+                    p.drawArc(QRectF(cx - 1.2, cy - 6.0, 9.2, 12.0), -55 * 16, 110 * 16)
 
         p.restore()
 
 
 def _relaunch_detached_if_console() -> None:
-    """Re-launches silently via pythonw.exe so double-clicking or closing CMD keeps Now Bar alive."""
+    """Re-launches silently via pythonw.exe so closing or clicking never leaves a CMD window."""
     if sys.platform != "win32":
         return
     if "--console" in sys.argv or "--detached" in sys.argv:
@@ -2752,14 +3015,18 @@ def _relaunch_detached_if_console() -> None:
 
 def main():
     _relaunch_detached_if_console()
-    _install_error_hook()
-    QApplication.setHighDpiScaleFactorRoundingPolicy(
-        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
-    )
-    app = QApplication(sys.argv)
-    app.setQuitOnLastWindowClosed(False)
-    bar = SpotifyNowBar()
-    sys.exit(app.exec())
+    try:
+        QApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+        )
+        app = QApplication(sys.argv)
+        app.setQuitOnLastWindowClosed(False)
+        bar = SpotifyNowBar()
+        sys.exit(app.exec())
+    except Exception:
+        log_path = Path(__file__).resolve().parent / "now_bar_error.log"
+        log_path.write_text(traceback.format_exc(), encoding="utf-8")
+        raise
 
 
 if __name__ == "__main__":

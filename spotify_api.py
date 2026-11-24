@@ -28,7 +28,7 @@ API_BASE = "https://api.spotify.com/v1"
 
 @dataclass
 class TrackItem:
-    """Represents a Spotify track or playlist entry inside the Now Bar drawer."""
+    """Represents a Spotify music track, podcast episode, or playlist entry."""
     uri: str
     title: str
     artist: str
@@ -43,6 +43,9 @@ class SpotifyExtraState:
     """Snapshot of playback metadata fetched from the Spotify Web API."""
     connected: bool = False
     track_uri: str = ""
+    is_podcast: bool = False
+    episode_title: str = ""
+    show_name: str = ""
     is_liked: bool = False
     shuffle: bool = False
     repeat: str = "off"          # "off" | "context" | "track"
@@ -55,10 +58,12 @@ class SpotifyExtraState:
 
 
 def _parse_track(obj: dict) -> Optional[TrackItem]:
-    """Converts a raw Spotify track JSON dict into a TrackItem."""
+    """Converts a raw Spotify music track JSON dict into a TrackItem (skips podcasts)."""
     if not isinstance(obj, dict):
         return None
     uri = obj.get("uri", "")
+    if obj.get("type") == "episode" or uri.startswith("spotify:episode:"):
+        return None
     name = (obj.get("name") or "").strip()
     if not uri or not name:
         return None
@@ -72,6 +77,25 @@ def _parse_track(obj: dict) -> Optional[TrackItem]:
         artist=artists or "Unknown Artist",
         duration_ms=dur,
     )
+
+
+def _parse_queue_item(obj: dict) -> Optional[TrackItem]:
+    """Converts either a music track or podcast episode inside the playback queue."""
+    if not isinstance(obj, dict):
+        return None
+    uri = obj.get("uri", "")
+    name = (obj.get("name") or "").strip()
+    if not uri or not name:
+        return None
+    if obj.get("type") == "episode" or uri.startswith("spotify:episode:"):
+        show_name = ((obj.get("show") or {}).get("name") or "Podcast").strip()
+        return TrackItem(
+            uri=uri,
+            title=name,
+            artist=show_name,
+            duration_ms=int(obj.get("duration_ms") or 0),
+        )
+    return _parse_track(obj)
 
 
 class SpotifyWebAPI:
@@ -310,17 +334,32 @@ class SpotifyWebAPI:
         return None
 
     def fetch_extra_state(self, include_queue: bool = True) -> SpotifyExtraState:
-        """Fetches active playback state, liked status, cover art, and optionally queue."""
+        """Fetches active playback state (music + podcasts), liked status, art, and queue."""
         if not self.is_connected:
             return SpotifyExtraState(connected=False)
 
-        res = self._req("GET", "/me/player")
+        res = self._req(
+            "GET", "/me/player", params={"additional_types": "track,episode"}
+        )
         if not res or res.status_code != 200:
             return SpotifyExtraState(connected=True)
 
         data = res.json()
         item = data.get("item") or {}
         track_uri = item.get("uri", "")
+        playing_type = (data.get("currently_playing_type") or "").lower()
+        is_podcast = (
+            playing_type == "episode"
+            or item.get("type") == "episode"
+            or track_uri.startswith("spotify:episode:")
+        )
+        episode_title = (item.get("name") or "").strip() if is_podcast else ""
+        show_name = (
+            ((item.get("show") or {}).get("name") or "").strip()
+            if is_podcast
+            else ""
+        )
+
         shuffle = bool(data.get("shuffle_state", False))
         repeat = data.get("repeat_state", "off")
         device = data.get("device") or {}
@@ -340,7 +379,7 @@ class SpotifyWebAPI:
             else -1
         )
 
-        # Unified 2026 library check endpoint
+        # Unified 2026 library check endpoint (works for both tracks & episodes)
         is_liked = False
         if track_uri:
             chk = self._req(
@@ -351,9 +390,14 @@ class SpotifyWebAPI:
                 if isinstance(arr, list) and arr:
                     is_liked = bool(arr[0])
 
-        # Medium-res album art (~300px) cached by URL
+        # Medium-res cover art (~300px) for tracks or podcast episodes
         cover_bytes = self._cached_cover
-        images = (item.get("album") or {}).get("images") or []
+        images = (
+            item.get("images")
+            or (item.get("show") or {}).get("images")
+            or (item.get("album") or {}).get("images")
+            or []
+        )
         if images:
             chosen = images[1] if len(images) > 1 else images[0]
             url = chosen.get("url", "")
@@ -377,6 +421,9 @@ class SpotifyWebAPI:
         return SpotifyExtraState(
             connected=True,
             track_uri=track_uri,
+            is_podcast=is_podcast,
+            episode_title=episode_title,
+            show_name=show_name,
             is_liked=is_liked,
             shuffle=shuffle,
             repeat=repeat,
@@ -395,7 +442,7 @@ class SpotifyWebAPI:
         raw_q = res.json().get("queue") or []
         items: List[TrackItem] = []
         for entry in raw_q[:20]:
-            t = _parse_track(entry)
+            t = _parse_queue_item(entry)
             if t:
                 items.append(t)
         return items
@@ -449,7 +496,7 @@ class SpotifyWebAPI:
     def fetch_playlist_items(
         self, playlist_id: str, limit: int = 30
     ) -> Tuple[List[TrackItem], str]:
-        # Spotify 2026 endpoint: GET /playlists/{id}/items
+        # Spotify 2026 endpoint: GET /playlists/{id}/items (music tracks only, skips podcasts)
         res = self._req(
             "GET", f"/playlists/{playlist_id}/items", params={"limit": limit}
         )
@@ -469,7 +516,7 @@ class SpotifyWebAPI:
             if t:
                 out.append(t)
         if not out:
-            return [], "No tracks returned — tap Play All above to listen"
+            return [], "No music tracks returned — tap Play All above to listen"
         return out, ""
 
     def search_tracks(self, query: str) -> List[TrackItem]:
