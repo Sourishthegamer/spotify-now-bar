@@ -51,7 +51,7 @@ A lightweight, native **Samsung One UI 7–style floating Now Bar** built exclus
 ## Optional: Link Spotify Web API (Unlocks Heart, Shuffle, Repeat, Queue, Playlists, Search & Volume)
 
 1. Go to the Spotify Developer Dashboard (`developer.spotify.com/dashboard`) and click **Create App**.
-2. Set **Redirect URI** to `<REDIRECT_URI>` and check **Web API**.
+2. Set **Redirect URI** to `[http://127.0.0.1:8888/callback](http://127.0.0.1:8888/callback)` and check **Web API**.
 3. Under **Settings → User Management**, add your Spotify account email.
 4. Copy your **Client ID**, right-click the green tray icon → **Connect / Re-link Spotify Web API...**, paste it in, and authorize in your browser.
 
