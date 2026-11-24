@@ -3,6 +3,8 @@
 A lightweight, native **Samsung One UI 7–style floating Now Bar** built exclusively for **Spotify on Windows 11**. Designed to run smoothly on integrated graphics (~40–55 MB RAM, ~0% CPU when hidden) with zero Electron or Rainmeter overhead.
 
 ## Demo
+https://github.com/user-attachments/assets/c5cd1759-44a2-442a-9fd2-c5fa06f51823
+
 
 <!-- Drag and drop LumiSnap_20261124_110842.mp4 here in the GitHub web editor -->
 
